@@ -1,0 +1,26 @@
+# Dataset
+data/
+
+# Outputs
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+venv310/
+.env
+
+# CSV files
+*.csv
+
+# Models
+*.h5
+*.pt
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db
