@@ -40,9 +40,9 @@ def _to_geometry_stats(value: Any) -> Optional[GeometryStats]:
 
 def infer_legacy_metadata(
     state_dict: Dict[str, torch.Tensor],
-    default_image_size: int = 160,
+    default_image_size: int = 224,
 ) -> Dict[str, Any]:
-    """Infer model configuration from a legacy plain state_dict checkpoint."""
+    """Infer model configuration from a plain legacy state_dict checkpoint."""
 
     if 'geom_branch.network.0.weight' not in state_dict:
         raise ValueError('Could not infer geometry input dimension from legacy checkpoint.')
@@ -51,9 +51,41 @@ def infer_legacy_metadata(
     geom_hidden_dim = int(state_dict['geom_branch.network.0.weight'].shape[0])
     geom_embedding_dim = int(state_dict['geom_branch.network.4.weight'].shape[0])
     deep_embedding_dim = int(state_dict['deep_branch.projection.0.weight'].shape[0])
-    fusion_hidden_dim = int(state_dict['fusion_head.0.weight'].shape[0])
-    final_embedding_dim = int(state_dict['fusion_head.4.weight'].shape[0])
-    fusion_input_dim = int(state_dict['fusion_head.0.weight'].shape[1])
+
+    projection_input_dim = int(state_dict['deep_branch.projection.0.weight'].shape[1])
+    if projection_input_dim == 1280:
+        backbone = 'mobilenet_v2'
+    elif projection_input_dim == 512:
+        backbone = 'resnet18'
+    elif projection_input_dim == 2048:
+        backbone = 'resnet50'
+    else:
+        raise ValueError(f'Could not infer backbone from projection input dim={projection_input_dim}.')
+
+    enable_identity_head = 'identity_classifier.weight' in state_dict
+    enable_age_head = any(key.startswith('age_regressor.') for key in state_dict.keys())
+    num_identity_classes = (
+        int(state_dict['identity_classifier.weight'].shape[0])
+        if enable_identity_head
+        else None
+    )
+
+    if 'fusion_head.network.0.weight' in state_dict:
+        fusion_hidden_dim = int(state_dict['fusion_head.network.0.weight'].shape[0])
+        final_embedding_dim = int(state_dict['fusion_head.network.4.weight'].shape[0])
+        fusion_input_dim = int(state_dict['fusion_head.network.0.weight'].shape[1])
+        fusion_type = 'concat'
+    elif 'fusion_head.output.0.weight' in state_dict:
+        fusion_hidden_dim = int(state_dict['fusion_head.output.0.weight'].shape[0])
+        final_embedding_dim = int(state_dict['fusion_head.output.3.weight'].shape[0])
+        fusion_input_dim = deep_embedding_dim + geom_embedding_dim
+        fusion_type = 'attention'
+    else:
+        # Legacy cnn_only / geom_only fusion used a plain Sequential.
+        fusion_hidden_dim = int(state_dict['fusion_head.0.weight'].shape[0])
+        final_embedding_dim = int(state_dict['fusion_head.4.weight'].shape[0])
+        fusion_input_dim = int(state_dict['fusion_head.0.weight'].shape[1])
+        fusion_type = 'concat'
 
     if fusion_input_dim == deep_embedding_dim + geom_embedding_dim:
         mode = 'hybrid'
@@ -64,12 +96,12 @@ def infer_legacy_metadata(
     else:
         raise ValueError('Could not infer model mode from fusion head dimensions.')
 
-    backbone = 'mobilenet_v2' if 'deep_branch.features.18.0.weight' in state_dict else 'resnet18'
-
     return {
         'geometry_input_dim': geometry_input_dim,
         'backbone': backbone,
         'mode': mode,
+        'fusion_type': fusion_type,
+        'attention_heads': 4,
         'embedding_dim': final_embedding_dim,
         'deep_embedding_dim': deep_embedding_dim,
         'geom_hidden_dim': geom_hidden_dim,
@@ -78,8 +110,54 @@ def infer_legacy_metadata(
         'dropout': 0.2,
         'image_size': int(default_image_size),
         'best_threshold': 0.5,
+        'enable_identity_head': enable_identity_head,
+        'enable_age_head': enable_age_head,
+        'num_identity_classes': num_identity_classes,
         'checkpoint_format': 'legacy_state_dict',
     }
+
+
+
+def _extract_metadata_from_rich_checkpoint(raw_checkpoint: Dict[str, Any], default_image_size: int) -> Dict[str, Any]:
+    if 'model_config' in raw_checkpoint:
+        model_config = dict(raw_checkpoint['model_config'])
+    else:
+        model_config = {
+            'geometry_input_dim': int(raw_checkpoint['geometry_input_dim']),
+            'backbone': raw_checkpoint['backbone'],
+            'mode': raw_checkpoint['mode'],
+            'embedding_dim': int(raw_checkpoint['embedding_dim']),
+            'deep_embedding_dim': int(raw_checkpoint.get('deep_embedding_dim', raw_checkpoint['embedding_dim'])),
+            'geom_hidden_dim': int(raw_checkpoint['geom_hidden_dim']),
+            'geom_embedding_dim': int(raw_checkpoint['geom_embedding_dim']),
+            'fusion_hidden_dim': int(raw_checkpoint['fusion_hidden_dim']),
+            'dropout': float(raw_checkpoint.get('dropout', 0.2)),
+            'fusion_type': raw_checkpoint.get('fusion_type', 'concat'),
+            'attention_heads': int(raw_checkpoint.get('attention_heads', 4)),
+            'enable_identity_head': bool(raw_checkpoint.get('enable_identity_head', False)),
+            'enable_age_head': bool(raw_checkpoint.get('enable_age_head', False)),
+            'num_identity_classes': raw_checkpoint.get('num_identity_classes'),
+        }
+
+    model_config['image_size'] = int(raw_checkpoint.get('image_size', default_image_size))
+    model_config['best_threshold'] = float(raw_checkpoint.get('best_threshold', 0.5))
+    model_config['checkpoint_format'] = 'rich_checkpoint'
+    return model_config
+
+
+def _upgrade_state_dict_keys(state_dict: Dict[str, torch.Tensor], metadata: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """Upgrade older parameter names to the current module layout."""
+
+    upgraded = dict(state_dict)
+
+    if metadata.get('mode') == 'hybrid' and metadata.get('fusion_type', 'concat') == 'concat':
+        legacy_keys = [key for key in upgraded.keys() if key.startswith('fusion_head.') and not key.startswith('fusion_head.network.')]
+        if legacy_keys and 'fusion_head.network.0.weight' not in upgraded:
+            for key in legacy_keys:
+                suffix = key[len('fusion_head.'):]
+                upgraded[f'fusion_head.network.{suffix}'] = upgraded.pop(key)
+
+    return upgraded
 
 
 
@@ -88,7 +166,7 @@ def load_checkpoint_bundle(
     device: torch.device | str,
     processed_csv: str | Path | None = None,
     train_split: str = 'train',
-    legacy_image_size: int = 160,
+    legacy_image_size: int = 224,
     legacy_backbone: str | None = None,
     legacy_mode: str | None = None,
 ) -> CheckpointBundle:
@@ -100,20 +178,7 @@ def load_checkpoint_bundle(
 
     if isinstance(raw_checkpoint, dict) and 'model_state_dict' in raw_checkpoint:
         state_dict = raw_checkpoint['model_state_dict']
-        metadata = {
-            'geometry_input_dim': int(raw_checkpoint['geometry_input_dim']),
-            'backbone': raw_checkpoint['backbone'],
-            'mode': raw_checkpoint['mode'],
-            'embedding_dim': int(raw_checkpoint['embedding_dim']),
-            'deep_embedding_dim': int(raw_checkpoint.get('deep_embedding_dim', raw_checkpoint['embedding_dim'])),
-            'geom_hidden_dim': int(raw_checkpoint['geom_hidden_dim']),
-            'geom_embedding_dim': int(raw_checkpoint['geom_embedding_dim']),
-            'fusion_hidden_dim': int(raw_checkpoint['fusion_hidden_dim']),
-            'dropout': float(raw_checkpoint.get('dropout', 0.2)),
-            'image_size': int(raw_checkpoint.get('image_size', legacy_image_size)),
-            'best_threshold': float(raw_checkpoint.get('best_threshold', 0.5)),
-            'checkpoint_format': 'rich_checkpoint',
-        }
+        metadata = _extract_metadata_from_rich_checkpoint(raw_checkpoint, default_image_size=legacy_image_size)
         geometry_stats = _to_geometry_stats(raw_checkpoint.get('geometry_stats'))
     elif isinstance(raw_checkpoint, (dict, OrderedDict)):
         state_dict = dict(raw_checkpoint)
@@ -126,19 +191,31 @@ def load_checkpoint_bundle(
     else:
         raise TypeError(f'Unsupported checkpoint format: {type(raw_checkpoint)!r}')
 
+    state_dict = _upgrade_state_dict_keys(state_dict, metadata)
+
     model = HybridFaceRecognizer(
-        geometry_input_dim=metadata['geometry_input_dim'],
+        geometry_input_dim=int(metadata['geometry_input_dim']),
         backbone=metadata['backbone'],
         mode=metadata['mode'],
-        deep_embedding_dim=metadata['deep_embedding_dim'],
-        geom_hidden_dim=metadata['geom_hidden_dim'],
-        geom_embedding_dim=metadata['geom_embedding_dim'],
-        fusion_hidden_dim=metadata['fusion_hidden_dim'],
-        final_embedding_dim=metadata['embedding_dim'],
+        deep_embedding_dim=int(metadata.get('deep_embedding_dim', metadata['embedding_dim'])),
+        geom_hidden_dim=int(metadata['geom_hidden_dim']),
+        geom_embedding_dim=int(metadata['geom_embedding_dim']),
+        fusion_hidden_dim=int(metadata['fusion_hidden_dim']),
+        final_embedding_dim=int(metadata['embedding_dim']),
         pretrained=False,
-        dropout=metadata['dropout'],
+        dropout=float(metadata.get('dropout', 0.2)),
+        fusion_type=metadata.get('fusion_type', 'concat'),
+        attention_heads=int(metadata.get('attention_heads', 4)),
+        enable_identity_head=bool(metadata.get('enable_identity_head', False)),
+        enable_age_head=bool(metadata.get('enable_age_head', False)),
+        num_identity_classes=metadata.get('num_identity_classes'),
     ).to(device)
-    model.load_state_dict(state_dict)
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        print(f'[warning] Missing checkpoint keys: {missing_keys}')
+    if unexpected_keys:
+        print(f'[warning] Unexpected checkpoint keys: {unexpected_keys}')
     model.eval()
 
     return CheckpointBundle(

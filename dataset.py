@@ -11,13 +11,17 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode, functional as TF
+
+from utils.geometry import flip_geometry_features
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+IMAGENET_FILL = tuple(int(channel * 255) for channel in IMAGENET_MEAN)
 
 
 @dataclass
@@ -26,29 +30,100 @@ class GeometryStats:
     std: np.ndarray
 
 
+class HybridTransform:
+    """Coupled image transform that can also update geometry features.
+
+    Only horizontal flip changes geometry in the current setup. Other image-only
+    augmentations are intentionally small so the geometry branch remains a stable
+    complementary signal while the image branch becomes more robust.
+    """
+
+    def __init__(
+        self,
+        train: bool = True,
+        image_size: int = 224,
+        allow_horizontal_flip: bool = True,
+        rotation_deg: float = 10.0,
+        brightness_jitter: float = 0.20,
+        contrast_jitter: float = 0.15,
+        saturation_jitter: float = 0.10,
+        blur_prob: float = 0.20,
+        blur_radius_min: float = 0.10,
+        blur_radius_max: float = 1.25,
+    ) -> None:
+        self.train = bool(train)
+        self.image_size = int(image_size)
+        self.allow_horizontal_flip = bool(allow_horizontal_flip)
+        self.rotation_deg = float(rotation_deg)
+        self.blur_prob = float(blur_prob)
+        self.blur_radius_min = float(blur_radius_min)
+        self.blur_radius_max = float(blur_radius_max)
+        self.color_jitter = transforms.ColorJitter(
+            brightness=brightness_jitter,
+            contrast=contrast_jitter,
+            saturation=saturation_jitter,
+        )
+
+    def _resize(self, image: Image.Image) -> Image.Image:
+        return image.resize((self.image_size, self.image_size), resample=Image.BILINEAR)
+
+    def __call__(self, image: Image.Image, geometry: np.ndarray | None = None):
+        image = self._resize(image)
+        geom = None if geometry is None else np.asarray(geometry, dtype=np.float32).copy()
+
+        if self.train:
+            if self.allow_horizontal_flip and random.random() < 0.5:
+                image = TF.hflip(image)
+                if geom is not None:
+                    geom = flip_geometry_features(geom)
+
+            if self.rotation_deg > 0.0:
+                angle = random.uniform(-self.rotation_deg, self.rotation_deg)
+                image = TF.rotate(
+                    image,
+                    angle,
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=IMAGENET_FILL,
+                )
+
+            image = self.color_jitter(image)
+
+            if self.blur_prob > 0.0 and random.random() < self.blur_prob:
+                radius = random.uniform(self.blur_radius_min, self.blur_radius_max)
+                image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+
+        image_tensor = TF.to_tensor(image)
+        image_tensor = TF.normalize(image_tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD)
+
+        if geom is None:
+            return image_tensor
+        return image_tensor, geom
+
+
+
 def build_image_transform(
     train: bool = True,
     image_size: int = 224,
-    allow_horizontal_flip: bool = False,
-) -> transforms.Compose:
-    """Create image transforms for aligned face images.
+    allow_horizontal_flip: bool = True,
+    rotation_deg: float = 10.0,
+    brightness_jitter: float = 0.20,
+    contrast_jitter: float = 0.15,
+    saturation_jitter: float = 0.10,
+    blur_prob: float = 0.20,
+) -> HybridTransform:
+    """Create coupled image/geometry transforms for aligned face images."""
 
-    Important:
-        Geometry features are precomputed offline. A horizontal image flip would
-        invalidate left/right-sensitive geometry features unless the geometry is
-        flipped as well. Therefore horizontal flip is disabled by default.
-    """
+    return HybridTransform(
+        train=train,
+        image_size=image_size,
+        allow_horizontal_flip=allow_horizontal_flip,
+        rotation_deg=rotation_deg,
+        brightness_jitter=brightness_jitter,
+        contrast_jitter=contrast_jitter,
+        saturation_jitter=saturation_jitter,
+        blur_prob=blur_prob,
+    )
 
-    ops = [transforms.Resize((image_size, image_size))]
-    if train:
-        if allow_horizontal_flip:
-            ops.append(transforms.RandomHorizontalFlip(p=0.5))
-        ops.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10))
-    ops.extend([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
-    return transforms.Compose(ops)
 
 
 def _load_dataframe(data: str | Path | pd.DataFrame, split: str | None = None) -> pd.DataFrame:
@@ -62,6 +137,7 @@ def _load_dataframe(data: str | Path | pd.DataFrame, split: str | None = None) -
     return df
 
 
+
 def _geometry_columns(df: pd.DataFrame) -> List[str]:
     columns = [column for column in df.columns if column.startswith('g') and column[1:].isdigit()]
     columns = sorted(columns, key=lambda c: int(c[1:]))
@@ -70,12 +146,14 @@ def _geometry_columns(df: pd.DataFrame) -> List[str]:
     return columns
 
 
+
 def compute_geometry_stats(data: str | Path | pd.DataFrame, split: str | None = None) -> GeometryStats:
     """Compute z-score statistics for geometric features from the training split."""
 
     df = _load_dataframe(data, split=split)
     geom_cols = _geometry_columns(df)
     values = df[geom_cols].to_numpy(dtype=np.float32)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
     return GeometryStats(mean=values.mean(axis=0), std=values.std(axis=0) + 1e-6)
 
 
@@ -122,7 +200,18 @@ def create_verification_pairs(
 
         selected = candidate_pairs[:positive_pairs_per_identity]
         for idx1, idx2 in selected:
-            positive_records.append({'idx1': idx1, 'idx2': idx2, 'label': 1})
+            age1 = float(df.iloc[idx1]['age']) if 'age' in df.columns else -1.0
+            age2 = float(df.iloc[idx2]['age']) if 'age' in df.columns else -1.0
+            positive_records.append(
+                {
+                    'idx1': idx1,
+                    'idx2': idx2,
+                    'label': 1,
+                    'age1': age1,
+                    'age2': age2,
+                    'age_gap': abs(age1 - age2) if age1 >= 0 and age2 >= 0 else -1.0,
+                }
+            )
 
     if not positive_records:
         raise ValueError('Verification requires at least one positive pair from an identity with two or more images.')
@@ -133,7 +222,18 @@ def create_verification_pairs(
         id1, id2 = rng.sample(identities, 2)
         idx1 = rng.choice(list(grouped[id1]))
         idx2 = rng.choice(list(grouped[id2]))
-        negative_records.append({'idx1': idx1, 'idx2': idx2, 'label': 0})
+        age1 = float(df.iloc[idx1]['age']) if 'age' in df.columns else -1.0
+        age2 = float(df.iloc[idx2]['age']) if 'age' in df.columns else -1.0
+        negative_records.append(
+            {
+                'idx1': idx1,
+                'idx2': idx2,
+                'label': 0,
+                'age1': age1,
+                'age2': age2,
+                'age_gap': abs(age1 - age2) if age1 >= 0 and age2 >= 0 else -1.0,
+            }
+        )
 
     pair_df = pd.DataFrame(positive_records + negative_records)
     pair_df = pair_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
@@ -145,7 +245,7 @@ class _BaseHybridDataset(Dataset):
         self,
         data: str | Path | pd.DataFrame,
         split: str | None = None,
-        transform: Optional[transforms.Compose] = None,
+        transform: Optional[HybridTransform] = None,
         geometry_stats: Optional[GeometryStats] = None,
     ) -> None:
         self.df = _load_dataframe(data, split=split)
@@ -156,19 +256,25 @@ class _BaseHybridDataset(Dataset):
             identity: idx for idx, identity in enumerate(sorted(map(str, self.df['identity'].unique().tolist())))
         }
 
-    def _load_row(self, row: pd.Series) -> Dict[str, torch.Tensor | int | str | float]:
+    def _load_row(self, row: pd.Series, row_index: int) -> Dict[str, torch.Tensor | int | str | float]:
         image_path = row['aligned_path'] if 'aligned_path' in row and pd.notna(row['aligned_path']) else row['image_path']
         image_path = Path(str(image_path))
         if not image_path.exists():
             raise FileNotFoundError(f'Image path not found in manifest: {image_path}')
 
         image = Image.open(image_path).convert('RGB')
-        image_tensor = self.transform(image)
-
         geom = row[self.geom_cols].to_numpy(dtype=np.float32)
+        geom = np.nan_to_num(geom, nan=0.0, posinf=0.0, neginf=0.0)
+
+        transformed = self.transform(image, geom)
+        if isinstance(transformed, tuple):
+            image_tensor, geom = transformed
+        else:
+            image_tensor = transformed
+
         if self.geometry_stats is not None:
             geom = (geom - self.geometry_stats.mean) / self.geometry_stats.std
-        geom_tensor = torch.tensor(geom, dtype=torch.float32)
+        geom_tensor = torch.tensor(np.asarray(geom, dtype=np.float32), dtype=torch.float32)
 
         identity = str(row['identity'])
         age = float(row['age']) if 'age' in row and not pd.isna(row['age']) else -1.0
@@ -180,6 +286,7 @@ class _BaseHybridDataset(Dataset):
             'identity_str': identity,
             'age': age,
             'path': str(image_path),
+            'index': int(row_index),
         }
 
     @property
@@ -191,24 +298,30 @@ class HybridTripletDataset(_BaseHybridDataset):
     """Triplet dataset for age-invariant metric learning.
 
     Anchor and positive samples come from the same identity, ideally with a large
-    age gap. Negative samples come from a different identity.
+    age gap. Negatives come from a different identity and can be upgraded from
+    random negatives to harder negatives via an embedding cache.
     """
 
     def __init__(
         self,
         data: str | Path | pd.DataFrame,
         split: str | None = None,
-        transform: Optional[transforms.Compose] = None,
+        transform: Optional[HybridTransform] = None,
         geometry_stats: Optional[GeometryStats] = None,
         min_age_gap: int = 5,
         seed: int = 42,
+        hard_negative_pool_size: int = 32,
     ) -> None:
         super().__init__(data=data, split=split, transform=transform, geometry_stats=geometry_stats)
         self.min_age_gap = int(min_age_gap)
         self.rng = random.Random(seed)
+        self.hard_negative_pool_size = int(max(4, hard_negative_pool_size))
         self.grouped_indices = {identity: list(indices) for identity, indices in self.df.groupby('identity').groups.items()}
         self.valid_identities = [identity for identity, idxs in self.grouped_indices.items() if len(idxs) >= 2]
         self.valid_anchor_indices = [idx for identity in self.valid_identities for idx in self.grouped_indices[identity]]
+        self.embedding_cache: Dict[int, np.ndarray] = {}
+        self.identity_choices = list(self.grouped_indices.keys())
+
         if not self.valid_anchor_indices:
             raise ValueError('Triplet dataset requires at least one identity with two or more images.')
         if len(self.grouped_indices) < 2:
@@ -216,6 +329,15 @@ class HybridTripletDataset(_BaseHybridDataset):
 
     def __len__(self) -> int:
         return len(self.valid_anchor_indices)
+
+    def update_embedding_cache(self, embedding_cache: Dict[int, np.ndarray]) -> None:
+        self.embedding_cache = {
+            int(index): np.asarray(embedding, dtype=np.float32)
+            for index, embedding in embedding_cache.items()
+        }
+
+    def clear_embedding_cache(self) -> None:
+        self.embedding_cache = {}
 
     def _sample_positive_index(self, anchor_index: int, identity: str) -> int:
         candidates = [idx for idx in self.grouped_indices[identity] if idx != anchor_index]
@@ -226,10 +348,7 @@ class HybridTripletDataset(_BaseHybridDataset):
             return self.rng.choice(candidates)
 
         anchor_age = float(self.df.iloc[anchor_index]['age'])
-        age_scored = [
-            (idx, abs(float(self.df.iloc[idx]['age']) - anchor_age))
-            for idx in candidates
-        ]
+        age_scored = [(idx, abs(float(self.df.iloc[idx]['age']) - anchor_age)) for idx in candidates]
         age_filtered = [item for item in age_scored if item[1] >= self.min_age_gap]
         if age_filtered:
             age_scored = age_filtered
@@ -238,20 +357,51 @@ class HybridTripletDataset(_BaseHybridDataset):
         top_k = age_scored[: min(3, len(age_scored))]
         return self.rng.choice(top_k)[0]
 
-    def _sample_negative_index(self, identity: str) -> int:
-        negative_identity = self.rng.choice([id_ for id_ in self.grouped_indices.keys() if id_ != identity])
-        return self.rng.choice(self.grouped_indices[negative_identity])
+    def _random_negative_candidates(self, identity: str) -> List[int]:
+        candidates: List[int] = []
+        for _ in range(self.hard_negative_pool_size):
+            negative_identity = self.rng.choice([id_ for id_ in self.identity_choices if id_ != identity])
+            candidates.append(self.rng.choice(self.grouped_indices[negative_identity]))
+        return candidates
+
+    def _sample_negative_index(self, anchor_index: int, identity: str) -> int:
+        candidates = self._random_negative_candidates(identity)
+
+        if anchor_index in self.embedding_cache:
+            anchor_embedding = self.embedding_cache[anchor_index]
+            scored_candidates = []
+            for candidate_index in candidates:
+                candidate_embedding = self.embedding_cache.get(candidate_index)
+                if candidate_embedding is None:
+                    continue
+                similarity = float(
+                    np.dot(anchor_embedding, candidate_embedding)
+                    / (np.linalg.norm(anchor_embedding) * np.linalg.norm(candidate_embedding) + 1e-8)
+                )
+                scored_candidates.append((similarity, candidate_index))
+
+            if scored_candidates:
+                scored_candidates.sort(key=lambda item: item[0], reverse=True)
+                top_hard = scored_candidates[: min(4, len(scored_candidates))]
+                return self.rng.choice(top_hard)[1]
+
+        if 'age' in self.df.columns:
+            anchor_age = float(self.df.iloc[anchor_index]['age'])
+            candidates.sort(key=lambda idx: abs(float(self.df.iloc[idx]['age']) - anchor_age))
+            return self.rng.choice(candidates[: min(4, len(candidates))])
+
+        return self.rng.choice(candidates)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         anchor_idx = self.valid_anchor_indices[index]
         anchor_row = self.df.iloc[anchor_idx]
         identity = str(anchor_row['identity'])
         positive_idx = self._sample_positive_index(anchor_idx, identity)
-        negative_idx = self._sample_negative_index(identity)
+        negative_idx = self._sample_negative_index(anchor_idx, identity)
 
-        anchor = self._load_row(anchor_row)
-        positive = self._load_row(self.df.iloc[positive_idx])
-        negative = self._load_row(self.df.iloc[negative_idx])
+        anchor = self._load_row(anchor_row, anchor_idx)
+        positive = self._load_row(self.df.iloc[positive_idx], positive_idx)
+        negative = self._load_row(self.df.iloc[negative_idx], negative_idx)
 
         return {
             'anchor_image': anchor['image'],
@@ -261,6 +411,14 @@ class HybridTripletDataset(_BaseHybridDataset):
             'negative_image': negative['image'],
             'negative_geom': negative['geometry'],
             'anchor_label': torch.tensor(anchor['identity'], dtype=torch.long),
+            'positive_label': torch.tensor(positive['identity'], dtype=torch.long),
+            'negative_label': torch.tensor(negative['identity'], dtype=torch.long),
+            'anchor_age': torch.tensor(anchor['age'], dtype=torch.float32),
+            'positive_age': torch.tensor(positive['age'], dtype=torch.float32),
+            'negative_age': torch.tensor(negative['age'], dtype=torch.float32),
+            'anchor_index': torch.tensor(int(anchor_idx), dtype=torch.long),
+            'positive_index': torch.tensor(int(positive_idx), dtype=torch.long),
+            'negative_index': torch.tensor(int(negative_idx), dtype=torch.long),
         }
 
 
@@ -271,7 +429,7 @@ class VerificationPairDataset(_BaseHybridDataset):
         self,
         data: str | Path | pd.DataFrame,
         split: str | None = None,
-        transform: Optional[transforms.Compose] = None,
+        transform: Optional[HybridTransform] = None,
         geometry_stats: Optional[GeometryStats] = None,
         min_age_gap: int = 5,
         positive_pairs_per_identity: int = 10,
@@ -293,14 +451,20 @@ class VerificationPairDataset(_BaseHybridDataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         pair = self.pairs.iloc[index]
-        first = self._load_row(self.df.iloc[int(pair['idx1'])])
-        second = self._load_row(self.df.iloc[int(pair['idx2'])])
+        first_index = int(pair['idx1'])
+        second_index = int(pair['idx2'])
+        first = self._load_row(self.df.iloc[first_index], first_index)
+        second = self._load_row(self.df.iloc[second_index], second_index)
+        age_gap = abs(float(first['age']) - float(second['age'])) if first['age'] >= 0 and second['age'] >= 0 else -1.0
         return {
             'image1': first['image'],
             'geom1': first['geometry'],
             'image2': second['image'],
             'geom2': second['geometry'],
             'label': torch.tensor(int(pair['label']), dtype=torch.long),
+            'age1': torch.tensor(float(first['age']), dtype=torch.float32),
+            'age2': torch.tensor(float(second['age']), dtype=torch.float32),
+            'age_gap': torch.tensor(float(age_gap), dtype=torch.float32),
         }
 
 
@@ -311,7 +475,7 @@ class ManifestImageDataset(_BaseHybridDataset):
         self,
         data: str | Path | pd.DataFrame,
         split: str | None = None,
-        transform: Optional[transforms.Compose] = None,
+        transform: Optional[HybridTransform] = None,
         geometry_stats: Optional[GeometryStats] = None,
     ) -> None:
         super().__init__(data=data, split=split, transform=transform, geometry_stats=geometry_stats)
@@ -320,8 +484,9 @@ class ManifestImageDataset(_BaseHybridDataset):
         return len(self.df)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        row = self._load_row(self.df.iloc[index])
+        row = self._load_row(self.df.iloc[index], index)
         return {
+            'index': torch.tensor(int(index), dtype=torch.long),
             'image': row['image'],
             'geometry': row['geometry'],
             'label': torch.tensor(int(row['identity']), dtype=torch.long),

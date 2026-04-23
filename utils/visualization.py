@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,26 +11,41 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 
+
 def plot_training_curves(history: Dict[str, list], save_dir: str | Path) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    if 'train_loss' in history and history['train_loss']:
+    if 'train_total_loss' in history and history['train_total_loss']:
         plt.figure(figsize=(7, 5))
-        plt.plot(history['train_loss'], marker='o')
+        plt.plot(history['train_total_loss'], marker='o', label='Total loss')
+        if 'train_triplet_loss' in history and history['train_triplet_loss']:
+            plt.plot(history['train_triplet_loss'], marker='s', label='Triplet loss')
+        if 'train_identity_loss' in history and history['train_identity_loss']:
+            plt.plot(history['train_identity_loss'], marker='^', label='Identity loss')
+        if 'train_age_loss' in history and history['train_age_loss']:
+            plt.plot(history['train_age_loss'], marker='d', label='Age loss')
         plt.xlabel('Epoch')
-        plt.ylabel('Triplet Loss')
-        plt.title('Training Loss')
+        plt.ylabel('Loss')
+        plt.title('Training Losses')
+        plt.legend()
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout()
-        plt.savefig(save_dir / 'train_loss.png', dpi=200)
+        plt.savefig(save_dir / 'train_losses.png', dpi=200)
         plt.close()
 
-    if 'val_accuracy' in history and history['val_accuracy']:
-        plt.figure(figsize=(7, 5))
-        plt.plot(history['val_accuracy'], marker='o', label='Accuracy')
-        if 'val_auc' in history and history['val_auc']:
-            plt.plot(history['val_auc'], marker='s', label='AUC')
+    metric_keys = [
+        ('val_accuracy', 'Accuracy'),
+        ('val_precision', 'Precision'),
+        ('val_recall', 'Recall'),
+        ('val_f1', 'F1'),
+        ('val_auc', 'AUC'),
+    ]
+    available = [(key, label) for key, label in metric_keys if key in history and history[key]]
+    if available:
+        plt.figure(figsize=(8, 5))
+        for key, label in available:
+            plt.plot(history[key], marker='o', label=label)
         plt.xlabel('Epoch')
         plt.ylabel('Metric')
         plt.title('Validation Metrics')
@@ -39,6 +54,7 @@ def plot_training_curves(history: Dict[str, list], save_dir: str | Path) -> None
         plt.tight_layout()
         plt.savefig(save_dir / 'val_metrics.png', dpi=200)
         plt.close()
+
 
 
 def plot_roc_curve(fpr: np.ndarray, tpr: np.ndarray, auc: float, save_path: str | Path) -> None:
@@ -56,6 +72,38 @@ def plot_roc_curve(fpr: np.ndarray, tpr: np.ndarray, auc: float, save_path: str 
     plt.tight_layout()
     plt.savefig(save_path, dpi=220)
     plt.close()
+
+
+
+def plot_age_gap_performance(age_gap_metrics: list[dict], save_path: str | Path, metric_key: str = 'accuracy') -> None:
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    labels = []
+    values = []
+    counts = []
+    for row in age_gap_metrics:
+        labels.append(row['age_gap_bin'])
+        values.append(0.0 if row[metric_key] is None else float(row[metric_key]))
+        counts.append(int(row['num_pairs']))
+
+    if not labels:
+        return
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(labels, values)
+    for idx, (value, count) in enumerate(zip(values, counts)):
+        plt.text(idx, value + 0.01, f'n={count}', ha='center', va='bottom', fontsize=8)
+    plt.ylim(0.0, 1.05)
+    plt.xlabel('Age gap bin (years)')
+    plt.ylabel(metric_key.replace('_', ' ').title())
+    title_metric = metric_key.replace('_', ' ').title()
+    plt.title(f'{title_metric} Across Age Gaps')
+    plt.grid(True, axis='y', linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220)
+    plt.close()
+
 
 
 def visualize_embeddings(
@@ -87,7 +135,7 @@ def visualize_embeddings(
         projected = projector.fit_transform(embeddings)
 
     plt.figure(figsize=(8, 6))
-    scatter = plt.scatter(projected[:, 0], projected[:, 1], c=labels, s=24, alpha=0.8)
+    plt.scatter(projected[:, 0], projected[:, 1], c=labels, s=24, alpha=0.8)
     plt.xlabel('Component 1')
     plt.ylabel('Component 2')
     plt.title('Embedding Visualization by Identity')
