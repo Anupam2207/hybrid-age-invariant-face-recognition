@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import argparse
 import json
 import random
@@ -569,7 +572,7 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.scheduler_min_lr)
     triplet_criterion = CosineBatchHardTripletLoss(margin=args.margin, use_batch_hard=args.use_batch_hard_mining)
-    scaler = torch.cuda.amp.GradScaler(enabled=runtime_profile.amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=runtime_profile.amp)
 
     start_epoch, history, epoch_rows, best_auc = maybe_resume_training(args, model, optimizer, scheduler, scaler, device)
     best_checkpoint_path = checkpoint_dir / 'best_model.pt'
@@ -601,7 +604,7 @@ def main() -> None:
                 for key, value in batch.items()
             }
 
-            with torch.cuda.amp.autocast(enabled=runtime_profile.amp):
+            with torch.amp.autocast("cuda", enabled=runtime_profile.amp):
                 anchor_out = model.forward_with_aux(batch['anchor_image'], batch['anchor_geom'])
                 positive_out = model.forward_with_aux(batch['positive_image'], batch['positive_geom'])
                 negative_out = model.forward_with_aux(batch['negative_image'], batch['negative_geom'])
