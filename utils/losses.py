@@ -76,7 +76,11 @@ class CosineBatchHardTripletLoss(nn.Module):
         negative_distances = 1.0 - F.cosine_similarity(anchor_embeddings, selected_negatives)
 
         losses = F.relu(positive_distances - negative_distances + self.margin)
-        loss = losses.mean()
+        active_mask = losses > 0
+        if bool(active_mask.any()):
+            loss = losses[active_mask].mean()
+        else:
+            loss = losses.mean() * 0.0
 
         diagnostics = {
             'avg_positive_distance': float(positive_distances.detach().mean().item()),

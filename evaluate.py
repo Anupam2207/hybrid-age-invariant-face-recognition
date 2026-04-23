@@ -1,9 +1,11 @@
-"""Evaluate a trained checkpoint on a verification split."""
+"""Evaluate a trained checkpoint on a verification split or fixed pair protocol."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -19,15 +21,16 @@ from utils.runtime import build_dataloader_kwargs, resolve_device, resolve_runti
 from utils.visualization import plot_age_gap_performance, plot_roc_curve
 
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Evaluate a trained hybrid face recognizer.')
+    parser = argparse.ArgumentParser(description='Evaluate a trained checkpoint on a verification split.')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--processed_csv', type=str, required=True)
     parser.add_argument('--split', type=str, default='test')
-    parser.add_argument('--train_split', type=str, default='train', help='Used to recompute geometry stats for legacy checkpoints.')
-    parser.add_argument('--batch_size', type=int, default=0, help='Use 0 for hardware-aware default.')
-    parser.add_argument('--num_workers', type=int, default=-1, help='Use -1 for hardware-aware default.')
+    parser.add_argument('--pair_csv', type=str, default=None, help='Optional fixed pair protocol for this split.')
+    parser.add_argument('--save_pairs_csv', type=str, default=None, help='Optional path to save the pair protocol actually used.')
+    parser.add_argument('--train_split', type=str, default='train', help='Used only for legacy checkpoints that need geometry stats.')
+    parser.add_argument('--batch_size', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=-1)
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--positive_pairs_per_identity', type=int, default=10)
@@ -43,13 +46,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-
 def parse_bins(bin_string: str) -> list[float]:
     bins = [float(value.strip()) for value in bin_string.split(',') if value.strip()]
     if len(bins) < 2:
         raise ValueError('At least two age-gap bin edges are required.')
     return bins
-
 
 
 def save_json(path: Path, payload: dict | list) -> None:
@@ -58,12 +59,23 @@ def save_json(path: Path, payload: dict | list) -> None:
         json.dump(payload, file, indent=2)
 
 
-
 def default_output_dir(checkpoint_path: str | Path, split: str) -> Path:
     checkpoint_path = Path(checkpoint_path)
     checkpoint_root = checkpoint_path.parent.parent if checkpoint_path.parent.name == 'checkpoints' else checkpoint_path.parent
     return checkpoint_root / f'{split}_evaluation'
 
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    if device.type == 'cuda' and enabled:
+        return torch.amp.autocast('cuda', enabled=True)
+    return nullcontext()
 
 
 def main() -> None:
@@ -105,13 +117,19 @@ def main() -> None:
         positive_pairs_per_identity=args.positive_pairs_per_identity,
         negative_multiplier=args.negative_multiplier,
         seed=args.seed,
+        pairs_csv=args.pair_csv,
     )
+    data_loader_kwargs = build_dataloader_kwargs(runtime_profile)
+    data_loader_kwargs['worker_init_fn'] = seed_worker
+    generator = torch.Generator()
+    generator.manual_seed(args.seed + 99)
     loader = DataLoader(
         dataset,
         batch_size=runtime_profile.eval_batch_size,
         shuffle=False,
         drop_last=False,
-        **build_dataloader_kwargs(runtime_profile),
+        generator=generator,
+        **data_loader_kwargs,
     )
 
     scores: list[float] = []
@@ -123,7 +141,7 @@ def main() -> None:
             geom1 = batch['geom1'].to(device, non_blocking=(device.type == 'cuda'))
             image2 = batch['image2'].to(device, non_blocking=(device.type == 'cuda'))
             geom2 = batch['geom2'].to(device, non_blocking=(device.type == 'cuda'))
-            with torch.cuda.amp.autocast(enabled=(runtime_profile.amp and device.type == 'cuda')):
+            with autocast_context(device, runtime_profile.amp):
                 _, _, similarity = bundle.model.forward_pair(image1, geom1, image2, geom2)
             scores.extend(similarity.cpu().numpy().tolist())
             labels.extend(batch['label'].cpu().numpy().tolist())
@@ -160,6 +178,10 @@ def main() -> None:
     for path in (output_dir, metrics_dir, plots_dir, logs_dir):
         path.mkdir(parents=True, exist_ok=True)
 
+    pairs_output_path = Path(args.save_pairs_csv) if args.save_pairs_csv else metrics_dir / f'{args.split}_pairs.csv'
+    pairs_output_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset.pairs.to_csv(pairs_output_path, index=False)
+
     pair_scores = pd.DataFrame(
         {
             'score': scores,
@@ -192,6 +214,8 @@ def main() -> None:
         'fusion_type': bundle.metadata.get('fusion_type', 'concat'),
         'image_size': bundle.metadata['image_size'],
         'split': args.split,
+        'pair_protocol_source': 'provided' if args.pair_csv else 'generated',
+        'pair_protocol_path': str(pairs_output_path),
         'runtime_profile': runtime_profile.to_dict(),
     }
     save_json(metrics_dir / 'metrics.json', summary)

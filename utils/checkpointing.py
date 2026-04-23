@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,23 @@ class CheckpointBundle:
     geometry_stats: Optional[GeometryStats]
     state_dict: Dict[str, torch.Tensor]
     raw_checkpoint: Any
+
+
+def atomic_torch_save(payload: dict, save_path: str | Path) -> None:
+    """Atomically write a checkpoint file to avoid partial saves on interruption."""
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(dir=save_path.parent, suffix='.tmp', delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, save_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 
@@ -141,6 +160,8 @@ def _extract_metadata_from_rich_checkpoint(raw_checkpoint: Dict[str, Any], defau
 
     model_config['image_size'] = int(raw_checkpoint.get('image_size', default_image_size))
     model_config['best_threshold'] = float(raw_checkpoint.get('best_threshold', 0.5))
+    if 'config_fingerprint' in raw_checkpoint:
+        model_config['config_fingerprint'] = str(raw_checkpoint['config_fingerprint'])
     model_config['checkpoint_format'] = 'rich_checkpoint'
     return model_config
 
@@ -211,11 +232,14 @@ def load_checkpoint_bundle(
         num_identity_classes=metadata.get('num_identity_classes'),
     ).to(device)
 
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        print(f'[warning] Missing checkpoint keys: {missing_keys}')
-    if unexpected_keys:
-        print(f'[warning] Unexpected checkpoint keys: {unexpected_keys}')
+    if metadata['checkpoint_format'] == 'rich_checkpoint':
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f'[warning] Missing legacy checkpoint keys: {missing_keys}')
+        if unexpected_keys:
+            print(f'[warning] Unexpected legacy checkpoint keys: {unexpected_keys}')
     model.eval()
 
     return CheckpointBundle(

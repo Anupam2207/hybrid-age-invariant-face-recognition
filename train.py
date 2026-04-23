@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
 import argparse
+import hashlib
 import json
+import platform
 import random
+import subprocess
+import sys
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,12 +32,12 @@ from dataset import (
     compute_geometry_stats,
 )
 from model import HybridFaceRecognizer
+from utils.checkpointing import atomic_torch_save
 from utils.losses import CosineBatchHardTripletLoss
 from utils.metrics import evaluate_age_gap_bins, evaluate_verification_scores
 from utils.runtime import build_dataloader_kwargs, resolve_device, resolve_runtime_profile
 from utils.splits import assert_no_identity_leakage
 from utils.visualization import plot_age_gap_performance, plot_roc_curve, plot_training_curves
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--processed_csv', type=str, required=True)
     parser.add_argument('--train_split', type=str, default='train')
     parser.add_argument('--val_split', type=str, default='val')
+    parser.add_argument('--val_pairs_csv', type=str, default=None, help='Optional fixed pair protocol for validation.')
+    parser.add_argument('--save_val_pairs_csv', type=str, default=None, help='Optional output path for the validation pair protocol actually used.')
 
     parser.add_argument('--epochs', type=int, default=24)
     parser.add_argument('--batch_size', type=int, default=0, help='Micro-batch size. Use 0 to auto-tune for the current hardware.')
@@ -73,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--scheduler_min_lr', type=float, default=1e-6)
     parser.add_argument('--grad_clip_norm', type=float, default=5.0)
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction, default=False, help='Enable stricter deterministic behavior for reproducibility.')
 
     parser.add_argument('--margin', type=float, default=0.25)
     parser.add_argument('--min_age_gap', type=int, default=5)
@@ -104,7 +112,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-
 def parse_bins(bin_string: str) -> list[float]:
     bins = [float(value.strip()) for value in bin_string.split(',') if value.strip()]
     if len(bins) < 2:
@@ -112,24 +119,100 @@ def parse_bins(bin_string: str) -> list[float]:
     return bins
 
 
+def _json_default(value: Any):
+    if isinstance(value, (np.integer, np.int32, np.int64)):
+        return int(value)
+    if isinstance(value, (np.floating, np.float32, np.float64)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f'Object of type {type(value)!r} is not JSON serializable')
 
-def set_seed(seed: int) -> None:
+
+def save_json(path: Path, payload: dict | list) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', encoding='utf-8') as file:
+        json.dump(payload, file, indent=2, default=_json_default)
+
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if hasattr(torch.backends, 'cudnn'):
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = not bool(deterministic)
+    try:
+        torch.use_deterministic_algorithms(bool(deterministic), warn_only=True)
+    except Exception:
+        pass
 
 
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
-def save_json(path: Path, payload: dict | list) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('w', encoding='utf-8') as file:
-        json.dump(payload, file, indent=2)
 
+def autocast_context(device: torch.device, enabled: bool):
+    if device.type == 'cuda' and enabled:
+        return torch.amp.autocast('cuda', enabled=True)
+    return nullcontext()
+
+
+def capture_rng_state() -> dict[str, Any]:
+    return {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(rng_state: dict[str, Any] | None, device: torch.device) -> None:
+    if not rng_state:
+        return
+    if 'python' in rng_state:
+        random.setstate(rng_state['python'])
+    if 'numpy' in rng_state:
+        np.random.set_state(rng_state['numpy'])
+    if 'torch' in rng_state:
+        torch.set_rng_state(rng_state['torch'])
+    if device.type == 'cuda' and rng_state.get('cuda') is not None:
+        torch.cuda.set_rng_state_all(rng_state['cuda'])
+
+
+def snapshot_environment(runtime_profile, args: argparse.Namespace) -> dict[str, Any]:
+    git_commit = None
+    try:
+        git_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+    except Exception:
+        git_commit = None
+
+    return {
+        'python_version': sys.version,
+        'platform': platform.platform(),
+        'torch_version': torch.__version__,
+        'cuda_available': bool(torch.cuda.is_available()),
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version() if hasattr(torch.backends, 'cudnn') else None,
+        'git_commit': git_commit,
+        'command': ' '.join(sys.argv),
+        'requested_args': vars(args),
+        'resolved_runtime': runtime_profile.to_dict(),
+    }
+
+
+def model_fingerprint(model: HybridFaceRecognizer, image_size: int) -> str:
+    payload = dict(model.export_config())
+    payload['image_size'] = int(image_size)
+    normalized = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
 
 
 def maybe_unfreeze_backbone(model: HybridFaceRecognizer, epoch_index: int, freeze_backbone_epochs: int, state: dict) -> None:
@@ -142,7 +225,6 @@ def maybe_unfreeze_backbone(model: HybridFaceRecognizer, epoch_index: int, freez
     model.unfreeze_backbone()
     state['backbone_unfrozen'] = True
     print(f'Backbone unfrozen at epoch {epoch_index + 1}.')
-
 
 
 def load_data(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -169,7 +251,6 @@ def load_data(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.
     return df.reset_index(drop=True), train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
-
 def make_datasets(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -177,11 +258,12 @@ def make_datasets(
     image_size: int,
     geometry_stats,
 ):
+    effective_rotation = 0.0 if args.mode == 'hybrid' else args.rotation_deg
     train_transform = build_image_transform(
         train=True,
         image_size=image_size,
         allow_horizontal_flip=args.allow_horizontal_flip,
-        rotation_deg=args.rotation_deg,
+        rotation_deg=effective_rotation,
         brightness_jitter=args.brightness_jitter,
         contrast_jitter=args.contrast_jitter,
         saturation_jitter=args.saturation_jitter,
@@ -197,13 +279,16 @@ def make_datasets(
         seed=args.seed,
         hard_negative_pool_size=args.hard_negative_pool_size,
     )
+
     cache_dataset = None
     if args.use_cached_hard_negatives:
         cache_dataset = ManifestImageDataset(
             train_df,
             transform=eval_transform,
             geometry_stats=geometry_stats,
+            seed=args.seed,
         )
+
     val_dataset = VerificationPairDataset(
         val_df,
         transform=eval_transform,
@@ -212,9 +297,9 @@ def make_datasets(
         positive_pairs_per_identity=args.positive_pairs_per_identity,
         negative_multiplier=args.negative_multiplier,
         seed=args.seed,
+        pairs_csv=args.val_pairs_csv,
     )
     return train_dataset, cache_dataset, val_dataset
-
 
 
 def make_dataloaders(
@@ -225,13 +310,25 @@ def make_dataloaders(
     eval_batch_size: int,
     cache_batch_size: int,
     dataloader_kwargs: dict,
-) -> tuple[DataLoader, DataLoader | None, DataLoader]:
+    seed: int,
+) -> tuple[DataLoader, DataLoader | None, DataLoader, dict[str, torch.Generator]]:
+    train_generator = torch.Generator()
+    train_generator.manual_seed(int(seed))
+    cache_generator = torch.Generator()
+    cache_generator.manual_seed(int(seed) + 1)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(int(seed) + 2)
+
+    common_kwargs = dict(dataloader_kwargs)
+    common_kwargs['worker_init_fn'] = seed_worker
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_batch_size,
         shuffle=True,
         drop_last=True,
-        **dataloader_kwargs,
+        generator=train_generator,
+        **common_kwargs,
     )
 
     cache_loader = None
@@ -241,7 +338,8 @@ def make_dataloaders(
             batch_size=cache_batch_size,
             shuffle=False,
             drop_last=False,
-            **dataloader_kwargs,
+            generator=cache_generator,
+            **common_kwargs,
         )
 
     val_loader = DataLoader(
@@ -249,10 +347,14 @@ def make_dataloaders(
         batch_size=eval_batch_size,
         shuffle=False,
         drop_last=False,
-        **dataloader_kwargs,
+        generator=val_generator,
+        **common_kwargs,
     )
-    return train_loader, cache_loader, val_loader
-
+    return train_loader, cache_loader, val_loader, {
+        'train': train_generator,
+        'cache': cache_generator,
+        'val': val_generator,
+    }
 
 
 def refresh_hard_negative_cache(
@@ -268,7 +370,7 @@ def refresh_hard_negative_cache(
         for batch in tqdm(cache_loader, desc='Refreshing hard-negative cache', leave=False):
             images = batch['image'].to(device, non_blocking=(device.type == 'cuda'))
             geometry = batch['geometry'].to(device, non_blocking=(device.type == 'cuda'))
-            with torch.cuda.amp.autocast(enabled=(use_amp and device.type == 'cuda')):
+            with autocast_context(device, use_amp):
                 embeddings = model(images, geometry)
             embeddings = embeddings.detach().cpu().numpy()
             indices = batch['index'].cpu().numpy().tolist()
@@ -277,7 +379,6 @@ def refresh_hard_negative_cache(
     train_dataset.update_embedding_cache(embedding_cache)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-
 
 
 def evaluate_model(
@@ -299,7 +400,7 @@ def evaluate_model(
             geom1 = batch['geom1'].to(device, non_blocking=(device.type == 'cuda'))
             image2 = batch['image2'].to(device, non_blocking=(device.type == 'cuda'))
             geom2 = batch['geom2'].to(device, non_blocking=(device.type == 'cuda'))
-            with torch.cuda.amp.autocast(enabled=(use_amp and device.type == 'cuda')):
+            with autocast_context(device, use_amp):
                 _, _, similarity = model.forward_pair(image1, geom1, image2, geom2)
             scores.extend(similarity.detach().cpu().numpy().tolist())
             labels.extend(batch['label'].detach().cpu().numpy().tolist())
@@ -334,7 +435,6 @@ def evaluate_model(
         'roc_thresholds': metrics.thresholds.tolist(),
         'age_gap_metrics': age_gap_metrics,
     }
-
 
 
 def compute_auxiliary_losses(
@@ -390,7 +490,6 @@ def compute_auxiliary_losses(
     return identity_loss, age_loss
 
 
-
 def build_checkpoint_payload(
     model: HybridFaceRecognizer,
     optimizer: torch.optim.Optimizer,
@@ -404,6 +503,9 @@ def build_checkpoint_payload(
     args: argparse.Namespace,
     runtime_profile,
     val_metrics: dict,
+    backbone_state: dict,
+    loader_generators: dict[str, torch.Generator],
+    environment_snapshot: dict[str, Any],
 ) -> dict:
     return {
         'model_state_dict': model.state_dict(),
@@ -412,6 +514,7 @@ def build_checkpoint_payload(
         'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
         'epoch': int(epoch),
         'model_config': model.export_config(),
+        'config_fingerprint': model_fingerprint(model, image_size),
         'geometry_input_dim': int(model.geometry_input_dim),
         'geometry_stats': {
             'mean': geometry_stats.mean.tolist(),
@@ -430,17 +533,34 @@ def build_checkpoint_payload(
         'epoch_rows': epoch_rows,
         'resolved_runtime': runtime_profile.to_dict(),
         'args': vars(args),
+        'backbone_state': dict(backbone_state),
+        'rng_state': capture_rng_state(),
+        'loader_generator_state': {name: generator.get_state() for name, generator in loader_generators.items()},
+        'environment': environment_snapshot,
     }
 
 
-
-def maybe_resume_training(args, model, optimizer, scheduler, scaler, device: torch.device):
+def maybe_resume_training(
+    args: argparse.Namespace,
+    model: HybridFaceRecognizer,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler,
+    device: torch.device,
+    expected_fingerprint: str,
+    backbone_state: dict,
+    loader_generators: dict[str, torch.Generator],
+):
     start_epoch = 0
     history = {
         'train_total_loss': [],
         'train_triplet_loss': [],
         'train_identity_loss': [],
         'train_age_loss': [],
+        'train_active_triplet_fraction': [],
+        'train_avg_positive_distance': [],
+        'train_avg_negative_distance': [],
+        'train_avg_hard_negative_similarity': [],
         'val_accuracy': [],
         'val_precision': [],
         'val_recall': [],
@@ -458,13 +578,36 @@ def maybe_resume_training(args, model, optimizer, scheduler, scaler, device: tor
     if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
         raise ValueError('Resume expects a rich checkpoint created by this training script.')
 
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    if 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict'] is not None:
+    checkpoint_fingerprint = checkpoint.get('config_fingerprint')
+    if checkpoint_fingerprint is not None and checkpoint_fingerprint != expected_fingerprint:
+        raise ValueError(
+            'Resume checkpoint does not match the current model/config. '
+            'Use identical architecture/image_size/fusion/head settings when resuming.'
+        )
+
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+    if checkpoint.get('optimizer_state_dict') is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+    if checkpoint.get('scheduler_state_dict') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    if 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+    if checkpoint.get('scaler_state_dict') is not None:
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    restored_backbone_state = checkpoint.get('backbone_state')
+    if isinstance(restored_backbone_state, dict):
+        backbone_state.clear()
+        backbone_state.update(restored_backbone_state)
+        if backbone_state.get('backbone_unfrozen', True):
+            model.unfreeze_backbone()
+        else:
+            model.freeze_backbone()
+
+    restore_rng_state(checkpoint.get('rng_state'), device)
+    loader_generator_state = checkpoint.get('loader_generator_state', {})
+    for name, generator in loader_generators.items():
+        state = loader_generator_state.get(name)
+        if state is not None:
+            generator.set_state(state)
 
     start_epoch = int(checkpoint.get('epoch', 0))
     history = dict(checkpoint.get('history', history))
@@ -478,10 +621,9 @@ def maybe_resume_training(args, model, optimizer, scheduler, scaler, device: tor
     return start_epoch, history, epoch_rows, best_auc
 
 
-
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
 
     device = resolve_device(args.device)
     runtime_profile = resolve_runtime_profile(
@@ -512,10 +654,12 @@ def main() -> None:
     for path in (output_dir, checkpoint_dir, metrics_dir, plot_dir, logs_dir):
         path.mkdir(parents=True, exist_ok=True)
 
+    environment = snapshot_environment(runtime_profile, args)
     save_json(logs_dir / 'requested_args.json', vars(args))
     save_json(logs_dir / 'resolved_runtime.json', runtime_profile.to_dict())
+    save_json(logs_dir / 'environment.json', environment)
 
-    full_df, train_df, val_df = load_data(args)
+    _, train_df, val_df = load_data(args)
     geometry_stats = compute_geometry_stats(train_df)
     save_json(
         logs_dir / 'geometry_stats.json',
@@ -533,7 +677,7 @@ def main() -> None:
         geometry_stats=geometry_stats,
     )
     dataloader_kwargs = build_dataloader_kwargs(runtime_profile)
-    train_loader, cache_loader, val_loader = make_dataloaders(
+    train_loader, cache_loader, val_loader, loader_generators = make_dataloaders(
         train_dataset=train_dataset,
         cache_dataset=cache_dataset,
         val_dataset=val_dataset,
@@ -541,6 +685,19 @@ def main() -> None:
         eval_batch_size=runtime_profile.eval_batch_size,
         cache_batch_size=runtime_profile.cache_batch_size,
         dataloader_kwargs=dataloader_kwargs,
+        seed=args.seed,
+    )
+
+    val_pairs_output_path = Path(args.save_val_pairs_csv) if args.save_val_pairs_csv else metrics_dir / 'val_pairs.csv'
+    val_pairs_output_path.parent.mkdir(parents=True, exist_ok=True)
+    val_dataset.pairs.to_csv(val_pairs_output_path, index=False)
+    save_json(
+        logs_dir / 'pair_protocols.json',
+        {
+            'validation_pairs_csv': str(val_pairs_output_path),
+            'validation_pairs_source': 'provided' if args.val_pairs_csv else 'generated',
+            'validation_num_pairs': int(len(val_dataset)),
+        },
     )
 
     num_identity_classes = int(train_df['identity'].nunique()) if args.enable_identity_head else None
@@ -572,9 +729,22 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs), eta_min=args.scheduler_min_lr)
     triplet_criterion = CosineBatchHardTripletLoss(margin=args.margin, use_batch_hard=args.use_batch_hard_mining)
-    scaler = torch.amp.GradScaler("cuda", enabled=runtime_profile.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=(runtime_profile.amp and device.type == 'cuda'))
 
-    start_epoch, history, epoch_rows, best_auc = maybe_resume_training(args, model, optimizer, scheduler, scaler, device)
+    expected_fingerprint = model_fingerprint(model, runtime_profile.image_size)
+    save_json(logs_dir / 'model_fingerprint.json', {'config_fingerprint': expected_fingerprint})
+
+    start_epoch, history, epoch_rows, best_auc = maybe_resume_training(
+        args=args,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        device=device,
+        expected_fingerprint=expected_fingerprint,
+        backbone_state=backbone_state,
+        loader_generators=loader_generators,
+    )
     best_checkpoint_path = checkpoint_dir / 'best_model.pt'
     age_gap_bins = parse_bins(args.age_gap_bins)
 
@@ -582,6 +752,11 @@ def main() -> None:
         raise RuntimeError('Training loader is empty. Reduce batch size or verify the manifest content.')
 
     for epoch in range(start_epoch, args.epochs):
+        train_dataset.set_epoch(epoch)
+        if cache_dataset is not None:
+            cache_dataset.set_epoch(epoch)
+        val_dataset.set_epoch(epoch)
+
         maybe_unfreeze_backbone(model, epoch, runtime_profile.freeze_backbone_epochs, backbone_state)
 
         if args.use_cached_hard_negatives and cache_loader is not None and epoch >= args.hard_negative_warmup_epochs:
@@ -595,6 +770,10 @@ def main() -> None:
         total_triplet_loss = 0.0
         total_identity_loss = 0.0
         total_age_loss = 0.0
+        total_active_triplet_fraction = 0.0
+        total_avg_positive_distance = 0.0
+        total_avg_negative_distance = 0.0
+        total_avg_hard_negative_similarity = 0.0
         optimizer.zero_grad(set_to_none=True)
         progress = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{args.epochs}')
 
@@ -604,7 +783,7 @@ def main() -> None:
                 for key, value in batch.items()
             }
 
-            with torch.amp.autocast("cuda", enabled=runtime_profile.amp):
+            with autocast_context(device, runtime_profile.amp):
                 anchor_out = model.forward_with_aux(batch['anchor_image'], batch['anchor_geom'])
                 positive_out = model.forward_with_aux(batch['positive_image'], batch['positive_geom'])
                 negative_out = model.forward_with_aux(batch['negative_image'], batch['negative_geom'])
@@ -647,22 +826,36 @@ def main() -> None:
             total_triplet_loss += float(triplet_loss.item())
             total_identity_loss += float(identity_loss.item())
             total_age_loss += float(age_loss.item())
+            total_active_triplet_fraction += float(mining_stats['active_triplet_fraction'])
+            total_avg_positive_distance += float(mining_stats['avg_positive_distance'])
+            total_avg_negative_distance += float(mining_stats['avg_negative_distance'])
+            total_avg_hard_negative_similarity += float(mining_stats['avg_hard_negative_similarity'])
             progress.set_postfix(
                 total=f'{raw_loss.item():.4f}',
                 triplet=f'{triplet_loss.item():.4f}',
+                active=f"{mining_stats['active_triplet_fraction']:.2f}",
                 hard_neg=f"{mining_stats['avg_hard_negative_similarity']:.4f}",
             )
 
         scheduler.step()
-        epoch_total_loss = total_loss / max(1, len(train_loader))
-        epoch_triplet_loss = total_triplet_loss / max(1, len(train_loader))
-        epoch_identity_loss = total_identity_loss / max(1, len(train_loader))
-        epoch_age_loss = total_age_loss / max(1, len(train_loader))
+        num_train_batches = max(1, len(train_loader))
+        epoch_total_loss = total_loss / num_train_batches
+        epoch_triplet_loss = total_triplet_loss / num_train_batches
+        epoch_identity_loss = total_identity_loss / num_train_batches
+        epoch_age_loss = total_age_loss / num_train_batches
+        epoch_active_triplet_fraction = total_active_triplet_fraction / num_train_batches
+        epoch_avg_positive_distance = total_avg_positive_distance / num_train_batches
+        epoch_avg_negative_distance = total_avg_negative_distance / num_train_batches
+        epoch_avg_hard_negative_similarity = total_avg_hard_negative_similarity / num_train_batches
 
         history['train_total_loss'].append(epoch_total_loss)
         history['train_triplet_loss'].append(epoch_triplet_loss)
         history['train_identity_loss'].append(epoch_identity_loss if args.enable_identity_head else 0.0)
         history['train_age_loss'].append(epoch_age_loss if args.enable_age_head else 0.0)
+        history['train_active_triplet_fraction'].append(epoch_active_triplet_fraction)
+        history['train_avg_positive_distance'].append(epoch_avg_positive_distance)
+        history['train_avg_negative_distance'].append(epoch_avg_negative_distance)
+        history['train_avg_hard_negative_similarity'].append(epoch_avg_hard_negative_similarity)
 
         val_metrics = evaluate_model(
             model=model,
@@ -685,6 +878,10 @@ def main() -> None:
             'train_triplet_loss': epoch_triplet_loss,
             'train_identity_loss': epoch_identity_loss if args.enable_identity_head else 0.0,
             'train_age_loss': epoch_age_loss if args.enable_age_head else 0.0,
+            'train_active_triplet_fraction': epoch_active_triplet_fraction,
+            'train_avg_positive_distance': epoch_avg_positive_distance,
+            'train_avg_negative_distance': epoch_avg_negative_distance,
+            'train_avg_hard_negative_similarity': epoch_avg_hard_negative_similarity,
             'val_accuracy': val_metrics['accuracy'],
             'val_precision': val_metrics['precision'],
             'val_recall': val_metrics['recall'],
@@ -706,6 +903,7 @@ def main() -> None:
             f"Epoch {epoch + 1:02d} | "
             f"train_total={epoch_total_loss:.4f} | "
             f"train_triplet={epoch_triplet_loss:.4f} | "
+            f"active_triplets={epoch_active_triplet_fraction:.3f} | "
             f"val_acc={val_metrics['accuracy']:.4f} | "
             f"val_f1={val_metrics['f1']:.4f} | "
             f"val_auc={val_metrics['auc']:.4f} | "
@@ -725,18 +923,21 @@ def main() -> None:
             args=args,
             runtime_profile=runtime_profile,
             val_metrics=val_metrics,
+            backbone_state=backbone_state,
+            loader_generators=loader_generators,
+            environment_snapshot=environment,
         )
 
-        torch.save(checkpoint_payload, checkpoint_dir / 'last_model.pt')
+        atomic_torch_save(checkpoint_payload, checkpoint_dir / 'last_model.pt')
         save_json(metrics_dir / 'last_val_metrics.json', {key: value for key, value in val_metrics.items() if key != 'age_gap_metrics'})
         save_json(metrics_dir / 'last_val_age_gap_metrics.json', val_metrics['age_gap_metrics'])
 
         if (epoch + 1) % runtime_profile.checkpoint_frequency == 0:
-            torch.save(checkpoint_payload, checkpoint_dir / f'epoch_{epoch + 1:03d}.pt')
+            atomic_torch_save(checkpoint_payload, checkpoint_dir / f'epoch_{epoch + 1:03d}.pt')
 
         if val_metrics['auc'] > best_auc:
             best_auc = val_metrics['auc']
-            torch.save(checkpoint_payload, best_checkpoint_path)
+            atomic_torch_save(checkpoint_payload, best_checkpoint_path)
             save_json(metrics_dir / 'best_val_metrics.json', {key: value for key, value in val_metrics.items() if key != 'age_gap_metrics'})
             save_json(metrics_dir / 'best_val_age_gap_metrics.json', val_metrics['age_gap_metrics'])
             plot_roc_curve(
@@ -760,21 +961,11 @@ def main() -> None:
             'best_auc': best_auc,
             'best_checkpoint': str(best_checkpoint_path),
             'last_checkpoint': str(checkpoint_dir / 'last_model.pt'),
-            'history_file': str(metrics_dir / 'history.json'),
-            'geometry_stats_file': str(logs_dir / 'geometry_stats.json'),
-            'backbone': runtime_profile.backbone,
-            'fusion_type': args.fusion_type,
-            'mode': args.mode,
-            'train_rows': int(len(train_df)),
-            'val_rows': int(len(val_df)),
-            'micro_batch_size': runtime_profile.batch_size,
-            'effective_batch_size': runtime_profile.effective_batch_size,
-            'image_size': runtime_profile.image_size,
+            'validation_pair_protocol': str(val_pairs_output_path),
+            'epochs_completed': len(epoch_rows),
+            'config_fingerprint': expected_fingerprint,
         },
     )
-
-    print(f'Best checkpoint saved to: {best_checkpoint_path}')
-    print('Training complete.')
 
 
 if __name__ == '__main__':
