@@ -42,8 +42,7 @@ class CosineBatchHardTripletLoss(nn.Module):
 
         similarities = torch.matmul(anchor_embeddings, candidate_embeddings.t())
         same_identity_mask = candidate_labels.unsqueeze(0).eq(anchor_labels.unsqueeze(1))
-        similarities = similarities.masked_fill(same_identity_mask, -1e9)
-
+        similarities = similarities.masked_fill(same_identity_mask, -1e4)
         hardest_indices = similarities.argmax(dim=1)
         hardest_similarities = similarities.gather(1, hardest_indices.unsqueeze(1)).squeeze(1)
         hardest_negatives = candidate_embeddings[hardest_indices]
