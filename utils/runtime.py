@@ -118,6 +118,23 @@ def _defaults_for_device(device: torch.device, requested_backbone: str) -> dict[
             'checkpoint_frequency': 5,
             'freeze_backbone_epochs': 1,
         }
+    elif device.type == 'cuda':
+        defaults = {
+            'profile_name': 'cuda_highend',
+            'backbone': 'resnet50' if requested_backbone == 'auto' else requested_backbone,
+            'image_size': 224,
+            'batch_size': 32,
+            'eval_batch_size': 64,
+            'cache_batch_size': 64,
+            'gradient_accumulation_steps': 1,
+            'num_workers': 4 if is_windows else 8,
+            'amp': True,
+            'pin_memory': True,
+            'persistent_workers': False,
+            'prefetch_factor': 4,
+            'checkpoint_frequency': 5,
+            'freeze_backbone_epochs': 1,
+        }
     elif device.type == 'mps':
         defaults = {
             'profile_name': 'apple_mps_safe',
@@ -198,7 +215,7 @@ def resolve_runtime_profile(
     resolved_accum = (
         defaults['gradient_accumulation_steps'] if int(gradient_accumulation_steps) <= 0 else int(gradient_accumulation_steps)
     )
-    resolved_workers = _auto_workers() if int(num_workers) < 0 else int(num_workers)
+    resolved_workers = defaults['num_workers'] if int(num_workers) < 0 else int(num_workers)
     resolved_checkpoint_frequency = (
         defaults['checkpoint_frequency'] if int(checkpoint_frequency) <= 0 else int(checkpoint_frequency)
     )
@@ -230,7 +247,7 @@ def resolve_runtime_profile(
         checkpoint_frequency=max(1, int(resolved_checkpoint_frequency)),
         freeze_backbone_epochs=max(0, int(resolved_freeze_epochs)),
         effective_batch_size=int(resolved_batch_size) * max(1, int(resolved_accum)),
-        windows_low_memory_mode=bool(defaults['windows_low_memory_mode']),
+        windows_low_memory_mode=bool(platform.system().lower().startswith('win') and resolved_workers == 0),
     )
     return profile
 
